@@ -96,6 +96,13 @@ limitations under the License.
         </dependency>
         <dependency>
             <groupId>org.apache.flink</groupId>
+            <artifactId>flink-cdc-pipeline-connector-elasticsearch</artifactId>
+            <version>${project.version}</version>
+            <type>test-jar</type>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.flink</groupId>
             <artifactId>flink-cdc-pipeline-connector-starrocks</artifactId>
             <version>${project.version}</version>
             <type>test-jar</type>
@@ -175,6 +182,7 @@ limitations under the License.
             <version>${testcontainers.version}</version>
             <scope>test</scope>
         </dependency>
+
     </dependencies>
 
     <build>
@@ -279,6 +287,16 @@ limitations under the License.
                             <artifactId>flink-cdc-pipeline-connector-doris</artifactId>
                             <version>${project.version}</version>
                             <destFileName>doris-cdc-pipeline-connector.jar</destFileName>
+                            <type>jar</type>
+                            <outputDirectory>${project.build.directory}/dependencies
+                            </outputDirectory>
+                        </artifactItem>
+
+                        <artifactItem>
+                            <groupId>org.apache.flink</groupId>
+                            <artifactId>flink-cdc-pipeline-connector-elasticsearch</artifactId>
+                            <version>${project.version}</version>
+                            <destFileName>elasticsearch-cdc-pipeline-connector.jar</destFileName>
                             <type>jar</type>
                             <outputDirectory>${project.build.directory}/dependencies
                             </outputDirectory>
