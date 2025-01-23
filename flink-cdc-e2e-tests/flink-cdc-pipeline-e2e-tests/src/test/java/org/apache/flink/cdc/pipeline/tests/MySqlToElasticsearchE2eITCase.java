@@ -17,21 +17,19 @@
 
 package org.apache.flink.cdc.pipeline.tests;
 
+import org.apache.flink.cdc.common.test.utils.TestUtils;
+import org.apache.flink.cdc.connectors.elasticsearch.sink.utils.ElasticsearchContainer;
+import org.apache.flink.cdc.connectors.mysql.testutils.MySqlContainer;
+import org.apache.flink.cdc.connectors.mysql.testutils.MySqlVersion;
+import org.apache.flink.cdc.connectors.mysql.testutils.UniqueDatabase;
+import org.apache.flink.cdc.pipeline.tests.utils.PipelineTestEnvironment;
+
 import co.elastic.clients.elasticsearch.ElasticsearchClient;
-import co.elastic.clients.elasticsearch.core.GetRequest;
-import co.elastic.clients.elasticsearch.core.GetResponse;
 import co.elastic.clients.elasticsearch.core.SearchRequest;
 import co.elastic.clients.elasticsearch.core.SearchResponse;
 import co.elastic.clients.elasticsearch.core.search.Hit;
 import co.elastic.clients.json.jackson.JacksonJsonpMapper;
 import co.elastic.clients.transport.rest_client.RestClientTransport;
-import org.apache.flink.cdc.common.test.utils.TestUtils;
-import org.apache.flink.cdc.connectors.doris.sink.utils.DorisContainer;
-import org.apache.flink.cdc.connectors.mysql.testutils.MySqlContainer;
-import org.apache.flink.cdc.connectors.mysql.testutils.MySqlVersion;
-import org.apache.flink.cdc.connectors.mysql.testutils.UniqueDatabase;
-import org.apache.flink.cdc.pipeline.tests.utils.PipelineTestEnvironment;
-import org.apache.flink.elasticsearch6.shaded.org.elasticsearch.client.RestHighLevelClient;
 import org.apache.http.HttpHost;
 import org.apache.http.auth.AuthScope;
 import org.apache.http.auth.UsernamePasswordCredentials;
@@ -48,7 +46,6 @@ import org.junit.runners.Parameterized;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testcontainers.containers.output.Slf4jLogConsumer;
-import org.testcontainers.elasticsearch.ElasticsearchContainer;
 import org.testcontainers.lifecycle.Startables;
 
 import java.io.IOException;
@@ -59,9 +56,9 @@ import java.util.*;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import static org.apache.flink.cdc.pipeline.tests.MySqlToDorisE2eITCase.DEFAULT_RESULT_VERIFY_TIMEOUT;
 import static org.junit.Assert.*;
-/** End-to-end tests for mysql cdc to Doris pipeline job. */
+
+/** End-to-end tests for mysql cdc to Elasticsearch pipeline job. */
 @RunWith(Parameterized.class)
 public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
     private static final Logger LOG = LoggerFactory.getLogger(MySqlToElasticsearchE2eITCase.class);
@@ -77,8 +74,9 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
     private static final String DEFAULT_USERNAME = "elastic";
     private static final String DEFAULT_PASSWORD = "123456";
 
+    public static final Duration DEFAULT_RESULT_VERIFY_TIMEOUT = Duration.ofSeconds(30);
 
-    private ElasticsearchClient client;
+    private ElasticsearchClient client = createElasticsearchClient();
 
     @ClassRule
     public static final MySqlContainer MYSQL =
@@ -94,12 +92,16 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
                             .withNetworkAliases("mysql");
 
     @ClassRule
-    public static final ElasticsearchContainer ELASTICSEARCH =
-             new ElasticsearchContainer(ELASTICSEARCH_VERSION)
-                     .withLogConsumer(new Slf4jLogConsumer(LOG))
-                     .withPassword(DEFAULT_PASSWORD)
-                     .withEnv("xpack.security.enabled", "true");
+    public static final ElasticsearchContainer ELASTICSEARCH =  createElasticsearchContainer();
 
+
+    private static ElasticsearchContainer createElasticsearchContainer() {
+        ElasticsearchContainer esContainer = new ElasticsearchContainer(ELASTICSEARCH_VERSION);
+        esContainer.withLogConsumer(new Slf4jLogConsumer(LOG));
+        esContainer.withPassword(DEFAULT_PASSWORD);
+        esContainer.withEnv("xpack.security.enabled", "true");
+        return esContainer;
+    }
 
     protected final UniqueDatabase mysqlInventoryDatabase =
             new UniqueDatabase(MYSQL, "mysql_inventory", MYSQL_TEST_USER, MYSQL_TEST_PASSWORD);
@@ -111,6 +113,7 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
         Startables.deepStart(Stream.of(ELASTICSEARCH)).join();
         LOG.info("Containers are started.");
     }
+
     @BeforeEach
     public void setUp() {
         client = createElasticsearchClient();
@@ -123,17 +126,15 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
         }
     }
 
-
     @Before
     public void before() throws Exception {
         super.before();
         mysqlInventoryDatabase.createAndInitialize();
         createElasticsearchDatabase(mysqlInventoryDatabase.getDatabaseName());
-
     }
 
     @After
-    public void after()  {
+    public void after() {
         super.after();
         mysqlInventoryDatabase.dropDatabase();
         try {
@@ -159,12 +160,12 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
                                 + "  server-time-zone: UTC\n"
                                 + "\n"
                                 + "sink:\n"
-                                + "  type: doris\n"
-                                + "  fenodes: doris:8030\n"
-                                + "  benodes: doris:8040\n"
+                                + "  type: elasticsearch\n"
+                                + "  hosts: elasticsearch:9092\n"
                                 + "  username: %s\n"
                                 + "  password: \"%s\"\n"
-                                + "  table.create.properties.replication_num: 1\n"
+                                + "  version: 8\n"
+                                + "  batch.size.max.bytes: 52428800\n"
                                 + "\n"
                                 + "pipeline:\n"
                                 + "  parallelism: %d",
@@ -175,12 +176,11 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
                         DEFAULT_PASSWORD,
                         parallelism);
         Path mysqlCdcJar = TestUtils.getResource("mysql-cdc-pipeline-connector.jar");
-        Path dorisCdcConnector = TestUtils.getResource("elasticsearch-cdc-pipeline-connector.jar");
+        Path ElasticsearchCdcConnector = TestUtils.getResource("elasticsearch-cdc-pipeline-connector.jar");
         Path mysqlDriverJar = TestUtils.getResource("mysql-driver.jar");
-        submitPipelineJob(pipelineJob, mysqlCdcJar, dorisCdcConnector, mysqlDriverJar);
+        submitPipelineJob(pipelineJob, mysqlCdcJar, ElasticsearchCdcConnector, mysqlDriverJar);
         waitUntilJobRunning(Duration.ofSeconds(30));
         LOG.info("Pipeline job is running");
-
 
         validateSinkResult(
                 databaseName,
@@ -197,7 +197,6 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
                         "108 | jacket | water resistent black wind breaker | 0.1 | null | null | null",
                         "109 | spare tire | 24 inch spare tire | 22.2 | null | null | null"));
 
-
         validateSinkResult(
                 databaseName,
                 "customers",
@@ -207,22 +206,14 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
                         "102 | user_2 | Shanghai | 123567891234",
                         "103 | user_3 | Shanghai | 123567891234",
                         "104 | user_4 | Shanghai | 123567891234"));
-
-
     }
 
-
-    public  void createElasticsearchDatabase(String databaseName) throws IOException {
-            client.indices().create(c -> c
-                    .index(databaseName)
-            );
+    public void createElasticsearchDatabase(String databaseName) throws IOException {
+        client.indices().create(c -> c.index(databaseName));
     }
 
-
-    public  void dropElasticsearchDatabase(String databaseName) throws IOException {
-            client.indices().delete(d -> d
-                    .index(databaseName)
-            );
+    public void dropElasticsearchDatabase(String databaseName) throws IOException {
+        client.indices().delete(d -> d.index(databaseName));
     }
 
     private void validateSinkResult(
@@ -230,19 +221,13 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
             throws Exception {
         waitAndVerify(
                 databaseName,
-                "SELECT * FROM " + tableName,
-                columnCount,
                 expected,
                 DEFAULT_RESULT_VERIFY_TIMEOUT.toMillis(),
                 true);
     }
 
-
-
     private void waitAndVerify(
             String databaseName,
-            String sql,
-            int numberOfColumns,
             List<String> expected,
             long timeoutMilliseconds,
             boolean inAnyOrder)
@@ -264,9 +249,8 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
                     }
                 }
                 LOG.info(
-                        "Executing {}::{} didn't get expected results.\nExpected: {}\n  Actual: {}",
+                        "Executing {}:: didn't get expected results.\nExpected: {}\n  Actual: {}",
                         databaseName,
-                        sql,
                         expected,
                         actual);
             } catch (SQLSyntaxErrorException t) {
@@ -274,48 +258,38 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
             }
             Thread.sleep(1000L);
         }
-        fail(String.format("Failed to verify content of %s::%s.", databaseName, sql));
+        fail(String.format("Failed to verify content of %s.", databaseName));
     }
 
-    private List<String> fetchTableContent(String databaseName)
-            throws Exception {
+    private List<String> fetchTableContent(String databaseName) throws Exception {
 
-            List<String> results = new ArrayList<>();
+        List<String> results = new ArrayList<>();
 
-            SearchRequest searchRequest = SearchRequest.of(s -> s
-                    .index(databaseName)
-                    .query(q -> q
-                            .matchAll(m -> m))
-            );
-            SearchResponse<Map> response = client.search( searchRequest,
-                    Map.class
-            );
-            // 执行搜索请求
-            SearchResponse<Map> searchResponse = client.search(searchRequest, Map.class);
+        SearchRequest searchRequest =
+                SearchRequest.of(s -> s.index(databaseName).query(q -> q.matchAll(m -> m)));
+        SearchResponse<Map> response = client.search(searchRequest, Map.class);
+        // 执行搜索请求
+        SearchResponse<Map> searchResponse = client.search(searchRequest, Map.class);
 
-            // 获取搜索结果
-            List<Hit<Map>> hits = searchResponse.hits().hits();
+        // 获取搜索结果
+        List<Hit<Map>> hits = searchResponse.hits().hits();
 
-
-            // 打印每个文档
-            for (Hit<Map> hit : hits) {
-                Map map = hit.source();
-                List<String> columns = new ArrayList<>();
-                Iterator<Map.Entry<String,String>> itr = map.entrySet().iterator();
-                while(itr.hasNext())
-                {
-                    Map.Entry<String,String> entry = itr.next();
-                    System.out.println("Key = " + entry.getKey() +
-                            ", Value = " + entry.getValue());
+        // 打印每个文档
+        for (Hit<Map> hit : hits) {
+            Map map = hit.source();
+            List<String> columns = new ArrayList<>();
+            Iterator<Map.Entry<String, String>> itr = map.entrySet().iterator();
+            while (itr.hasNext()) {
+                Map.Entry<String, String> entry = itr.next();
+                System.out.println("Key = " + entry.getKey() + ", Value = " + entry.getValue());
                 columns.add(entry.getValue());
-                }
-
-                results.add(String.join(" | ", columns));
             }
+
+            results.add(String.join(" | ", columns));
+        }
 
         return results;
     }
-
 
     private ElasticsearchClient createElasticsearchClient() {
         final CredentialsProvider credentialsProvider = new BasicCredentialsProvider();
@@ -342,5 +316,4 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
                         new JacksonJsonpMapper());
         return new ElasticsearchClient(transport);
     }
-
 }
