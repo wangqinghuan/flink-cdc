@@ -38,25 +38,35 @@ import org.apache.http.impl.client.BasicCredentialsProvider;
 import org.apache.http.impl.nio.client.HttpAsyncClientBuilder;
 import org.elasticsearch.client.RestClient;
 import org.elasticsearch.client.RestClientBuilder;
-import org.junit.*;
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.BeforeClass;
+import org.junit.ClassRule;
+import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testcontainers.containers.output.Slf4jLogConsumer;
+import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.lifecycle.Startables;
 
 import java.io.IOException;
 import java.nio.file.Path;
-import java.sql.*;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
+import java.sql.SQLSyntaxErrorException;
+import java.sql.Statement;
 import java.time.Duration;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import static org.junit.Assert.*;
+import static org.junit.Assert.fail;
 
 /** End-to-end tests for mysql cdc to Elasticsearch pipeline job. */
 @RunWith(Parameterized.class)
@@ -68,14 +78,10 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
     // ------------------------------------------------------------------------------------------
     protected static final String MYSQL_TEST_USER = "mysqluser";
     protected static final String MYSQL_TEST_PASSWORD = "mysqlpw";
-    protected static final String MYSQL_DRIVER_CLASS = "com.mysql.cj.jdbc.Driver";
-
     private static final String ELASTICSEARCH_VERSION = "8.12.1";
     private static final String DEFAULT_USERNAME = "elastic";
     private static final String DEFAULT_PASSWORD = "123456";
-
     public static final Duration DEFAULT_RESULT_VERIFY_TIMEOUT = Duration.ofSeconds(30);
-
     private ElasticsearchClient client = createElasticsearchClient();
 
     @ClassRule
@@ -91,17 +97,20 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
                             .withNetwork(NETWORK)
                             .withNetworkAliases("mysql");
 
-    @ClassRule
-    public static final ElasticsearchContainer ELASTICSEARCH =  createElasticsearchContainer();
-
-
-    private static ElasticsearchContainer createElasticsearchContainer() {
-        ElasticsearchContainer esContainer = new ElasticsearchContainer(ELASTICSEARCH_VERSION);
-        esContainer.withLogConsumer(new Slf4jLogConsumer(LOG));
-        esContainer.withPassword(DEFAULT_PASSWORD);
-        esContainer.withEnv("xpack.security.enabled", "true");
-        return esContainer;
-    }
+    private static final org.testcontainers.elasticsearch.ElasticsearchContainer ELASTICSEARCH =
+            new ElasticsearchContainer(ELASTICSEARCH_VERSION)
+                    .withNetwork(NETWORK)
+                    .withNetworkAliases("elasticsearch")
+                    .withEnv("discovery.type", "single-node")
+                    .withEnv("xpack.security.enabled", "false")
+                    .withEnv("ES_JAVA_OPTS", "-Xms2g -Xmx2g")
+                    .withExposedPorts(9200, 9300)
+                    .withLogConsumer(new Slf4jLogConsumer(LOG))
+                    .waitingFor(
+                            Wait.forHttp("/_cluster/health")
+                                    .forStatusCodeMatching(
+                                            response -> response == 200 || response == 401)
+                                    .withStartupTimeout(Duration.ofMinutes(2)));
 
     protected final UniqueDatabase mysqlInventoryDatabase =
             new UniqueDatabase(MYSQL, "mysql_inventory", MYSQL_TEST_USER, MYSQL_TEST_PASSWORD);
@@ -114,23 +123,14 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
         LOG.info("Containers are started.");
     }
 
-    @BeforeEach
-    public void setUp() {
-        client = createElasticsearchClient();
-    }
-
-    @AfterEach
-    public void tearDown() throws Exception {
-        if (client != null) {
-            client.shutdown();
-        }
-    }
-
     @Before
     public void before() throws Exception {
         super.before();
         mysqlInventoryDatabase.createAndInitialize();
-        createElasticsearchDatabase(mysqlInventoryDatabase.getDatabaseName());
+        client = createElasticsearchClient();
+        createElasticsearchDatabase(mysqlInventoryDatabase.getDatabaseName(), "products");
+
+        createElasticsearchDatabase(mysqlInventoryDatabase.getDatabaseName(), "customers");
     }
 
     @After
@@ -138,7 +138,11 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
         super.after();
         mysqlInventoryDatabase.dropDatabase();
         try {
-            dropElasticsearchDatabase(mysqlInventoryDatabase.getDatabaseName());
+            dropElasticsearchDatabase(mysqlInventoryDatabase.getDatabaseName(), "products");
+            dropElasticsearchDatabase(mysqlInventoryDatabase.getDatabaseName(), "customers");
+            if (client != null) {
+                client.shutdown();
+            }
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
@@ -161,31 +165,30 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
                                 + "\n"
                                 + "sink:\n"
                                 + "  type: elasticsearch\n"
-                                + "  hosts: elasticsearch:9092\n"
-                                + "  username: %s\n"
-                                + "  password: \"%s\"\n"
-                                + "  version: 8\n"
-                                + "  batch.size.max.bytes: 52428800\n"
+                                + "  hosts: http://elasticsearch:9200\n"
+                                + "  version: %s\n"
+                                + "  batch.size.max.bytes: 5242880\n"
+                                + "  record.size.max.bytes: 5242880\n"
                                 + "\n"
                                 + "pipeline:\n"
-                                + "  parallelism: %d",
+                                + "  parallelism: 1",
                         MYSQL_TEST_USER,
                         MYSQL_TEST_PASSWORD,
                         databaseName,
-                        DEFAULT_USERNAME,
-                        DEFAULT_PASSWORD,
-                        parallelism);
+                        ELASTICSEARCH_VERSION.split("\\.")[0] // Use major version number
+                        );
         Path mysqlCdcJar = TestUtils.getResource("mysql-cdc-pipeline-connector.jar");
-        Path ElasticsearchCdcConnector = TestUtils.getResource("elasticsearch-cdc-pipeline-connector.jar");
+        Path elasticsearchCdcConnector =
+                TestUtils.getResource("elasticsearch-cdc-pipeline-connector.jar");
         Path mysqlDriverJar = TestUtils.getResource("mysql-driver.jar");
-        submitPipelineJob(pipelineJob, mysqlCdcJar, ElasticsearchCdcConnector, mysqlDriverJar);
+        submitPipelineJob(pipelineJob, mysqlCdcJar, elasticsearchCdcConnector, mysqlDriverJar);
         waitUntilJobRunning(Duration.ofSeconds(30));
         LOG.info("Pipeline job is running");
 
         validateSinkResult(
                 databaseName,
                 "products",
-                7,
+                Arrays.asList("id", "name", "description", "weight", "enum_c", "json_c", "point_c"),
                 Arrays.asList(
                         "101 | scooter | Small 2-wheel scooter | 3.14 | red | {\"key1\": \"value1\"} | {\"coordinates\":[1,1],\"type\":\"Point\",\"srid\":0}",
                         "102 | car battery | 12V car battery | 8.1 | white | {\"key2\": \"value2\"} | {\"coordinates\":[2,2],\"type\":\"Point\",\"srid\":0}",
@@ -198,29 +201,110 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
                         "109 | spare tire | 24 inch spare tire | 22.2 | null | null | null"));
 
         validateSinkResult(
-                databaseName,
+                mysqlInventoryDatabase.getDatabaseName(),
                 "customers",
-                4,
+                Arrays.asList("id", "name", "address", "phone_number"),
                 Arrays.asList(
                         "101 | user_1 | Shanghai | 123567891234",
                         "102 | user_2 | Shanghai | 123567891234",
                         "103 | user_3 | Shanghai | 123567891234",
                         "104 | user_4 | Shanghai | 123567891234"));
+
+        LOG.info("Begin incremental reading stage.");
+        // generate binlogs
+        String mysqlJdbcUrl =
+                String.format(
+                        "jdbc:mysql://%s:%s/%s",
+                        MYSQL.getHost(), MYSQL.getDatabasePort(), databaseName);
+        try (Connection conn =
+                        DriverManager.getConnection(
+                                mysqlJdbcUrl, MYSQL_TEST_USER, MYSQL_TEST_PASSWORD);
+                Statement stat = conn.createStatement()) {
+
+            stat.execute(
+                    "INSERT INTO products VALUES (default,'jacket','water resistent white wind breaker',0.2, null, null, null);"); // 110
+
+            validateSinkResult(
+                    databaseName,
+                    "products",
+                    Arrays.asList(
+                            "id", "name", "description", "weight", "enum_c", "json_c", "point_c"),
+                    Arrays.asList(
+                            "101 | scooter | Small 2-wheel scooter | 3.14 | red | {\"key1\": \"value1\"} | {\"coordinates\":[1,1],\"type\":\"Point\",\"srid\":0}",
+                            "102 | car battery | 12V car battery | 8.1 | white | {\"key2\": \"value2\"} | {\"coordinates\":[2,2],\"type\":\"Point\",\"srid\":0}",
+                            "103 | 12-pack drill bits | 12-pack of drill bits with sizes ranging from #40 to #3 | 0.8 | red | {\"key3\": \"value3\"} | {\"coordinates\":[3,3],\"type\":\"Point\",\"srid\":0}",
+                            "104 | hammer | 12oz carpenter's hammer | 0.75 | white | {\"key4\": \"value4\"} | {\"coordinates\":[4,4],\"type\":\"Point\",\"srid\":0}",
+                            "105 | hammer | 14oz carpenter's hammer | 0.875 | red | {\"k1\": \"v1\", \"k2\": \"v2\"} | {\"coordinates\":[5,5],\"type\":\"Point\",\"srid\":0}",
+                            "106 | hammer | 16oz carpenter's hammer | 1.0 | null | null | null",
+                            "107 | rocks | box of assorted rocks | 5.3 | null | null | null",
+                            "108 | jacket | water resistent black wind breaker | 0.1 | null | null | null",
+                            "109 | spare tire | 24 inch spare tire | 22.2 | null | null | null",
+                            "110 | jacket | water resistent white wind breaker | 0.2 | null | null | null"));
+
+            stat.execute("UPDATE products SET description='18oz carpenter hammer' WHERE id=106;");
+            stat.execute("UPDATE products SET weight='5.1' WHERE id=107;");
+            validateSinkResult(
+                    databaseName,
+                    "products",
+                    Arrays.asList(
+                            "id", "name", "description", "weight", "enum_c", "json_c", "point_c"),
+                    Arrays.asList(
+                            "101 | scooter | Small 2-wheel scooter | 3.14 | red | {\"key1\": \"value1\"} | {\"coordinates\":[1,1],\"type\":\"Point\",\"srid\":0}",
+                            "102 | car battery | 12V car battery | 8.1 | white | {\"key2\": \"value2\"} | {\"coordinates\":[2,2],\"type\":\"Point\",\"srid\":0}",
+                            "103 | 12-pack drill bits | 12-pack of drill bits with sizes ranging from #40 to #3 | 0.8 | red | {\"key3\": \"value3\"} | {\"coordinates\":[3,3],\"type\":\"Point\",\"srid\":0}",
+                            "104 | hammer | 12oz carpenter's hammer | 0.75 | white | {\"key4\": \"value4\"} | {\"coordinates\":[4,4],\"type\":\"Point\",\"srid\":0}",
+                            "105 | hammer | 14oz carpenter's hammer | 0.875 | red | {\"k1\": \"v1\", \"k2\": \"v2\"} | {\"coordinates\":[5,5],\"type\":\"Point\",\"srid\":0}",
+                            "106 | hammer | 18oz carpenter hammer | 1.0 | null | null | null",
+                            "107 | rocks | box of assorted rocks | 5.1 | null | null | null",
+                            "108 | jacket | water resistent black wind breaker | 0.1 | null | null | null",
+                            "109 | spare tire | 24 inch spare tire | 22.2 | null | null | null",
+                            "110 | jacket | water resistent white wind breaker | 0.2 | null | null | null"));
+
+            stat.execute("DELETE FROM products WHERE id=101;");
+            stat.execute(
+                    "INSERT INTO products VALUES (default,'scooter','Big 2-wheel scooter ',5.18, null, null, null);"); // 111
+            stat.execute(
+                    "INSERT INTO products VALUES (default,'finally', null, 2.14, null, null, null);"); // 112
+            validateSinkResult(
+                    databaseName,
+                    "products",
+                    Arrays.asList(
+                            "id", "name", "description", "weight", "enum_c", "json_c", "point_c"),
+                    Arrays.asList(
+                            "102 | car battery | 12V car battery | 8.1 | white | {\"key2\": \"value2\"} | {\"coordinates\":[2,2],\"type\":\"Point\",\"srid\":0}",
+                            "103 | 12-pack drill bits | 12-pack of drill bits with sizes ranging from #40 to #3 | 0.8 | red | {\"key3\": \"value3\"} | {\"coordinates\":[3,3],\"type\":\"Point\",\"srid\":0}",
+                            "104 | hammer | 12oz carpenter's hammer | 0.75 | white | {\"key4\": \"value4\"} | {\"coordinates\":[4,4],\"type\":\"Point\",\"srid\":0}",
+                            "105 | hammer | 14oz carpenter's hammer | 0.875 | red | {\"k1\": \"v1\", \"k2\": \"v2\"} | {\"coordinates\":[5,5],\"type\":\"Point\",\"srid\":0}",
+                            "106 | hammer | 18oz carpenter hammer | 1.0 | null | null | null",
+                            "107 | rocks | box of assorted rocks | 5.1 | null | null | null",
+                            "108 | jacket | water resistent black wind breaker | 0.1 | null | null | null",
+                            "109 | spare tire | 24 inch spare tire | 22.2 | null | null | null",
+                            "110 | jacket | water resistent white wind breaker | 0.2 | null | null | null",
+                            "111 | scooter | Big 2-wheel scooter  | 5.18 | null | null | null",
+                            "112 | finally | null | 2.14 | null | null | null"));
+        } catch (SQLException e) {
+            LOG.error("Update table for CDC failed.", e);
+            throw e;
+        }
     }
 
-    public void createElasticsearchDatabase(String databaseName) throws IOException {
-        client.indices().create(c -> c.index(databaseName));
+    public void createElasticsearchDatabase(String databaseName, String tableName)
+            throws IOException {
+        client.indices().create(c -> c.index(databaseName + "." + tableName));
     }
 
-    public void dropElasticsearchDatabase(String databaseName) throws IOException {
-        client.indices().delete(d -> d.index(databaseName));
+    public void dropElasticsearchDatabase(String databaseName, String tableName)
+            throws IOException {
+        client.indices().delete(d -> d.index(databaseName + "." + tableName));
     }
 
     private void validateSinkResult(
-            String databaseName, String tableName, int columnCount, List<String> expected)
+            String databaseName, String tableName, List<String> columns, List<String> expected)
             throws Exception {
         waitAndVerify(
                 databaseName,
+                tableName,
+                columns,
                 expected,
                 DEFAULT_RESULT_VERIFY_TIMEOUT.toMillis(),
                 true);
@@ -228,6 +312,8 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
 
     private void waitAndVerify(
             String databaseName,
+            String tableName,
+            List<String> columns,
             List<String> expected,
             long timeoutMilliseconds,
             boolean inAnyOrder)
@@ -235,7 +321,7 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
         long deadline = System.currentTimeMillis() + timeoutMilliseconds;
         while (System.currentTimeMillis() < deadline) {
             try {
-                List<String> actual = fetchTableContent(databaseName);
+                List<String> actual = fetchTableContent(databaseName, tableName, columns);
                 if (inAnyOrder) {
                     if (expected.stream()
                             .sorted()
@@ -261,31 +347,28 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
         fail(String.format("Failed to verify content of %s.", databaseName));
     }
 
-    private List<String> fetchTableContent(String databaseName) throws Exception {
+    private List<String> fetchTableContent(
+            String databaseName, String tableName, List<String> columns) throws Exception {
 
         List<String> results = new ArrayList<>();
 
         SearchRequest searchRequest =
-                SearchRequest.of(s -> s.index(databaseName).query(q -> q.matchAll(m -> m)));
-        SearchResponse<Map> response = client.search(searchRequest, Map.class);
-        // 执行搜索请求
+                SearchRequest.of(
+                        s ->
+                                s.index(databaseName + "." + tableName)
+                                        .query(q -> q.matchAll(m -> m))
+                                        .size(100));
         SearchResponse<Map> searchResponse = client.search(searchRequest, Map.class);
 
-        // 获取搜索结果
         List<Hit<Map>> hits = searchResponse.hits().hits();
 
-        // 打印每个文档
         for (Hit<Map> hit : hits) {
             Map map = hit.source();
-            List<String> columns = new ArrayList<>();
-            Iterator<Map.Entry<String, String>> itr = map.entrySet().iterator();
-            while (itr.hasNext()) {
-                Map.Entry<String, String> entry = itr.next();
-                System.out.println("Key = " + entry.getKey() + ", Value = " + entry.getValue());
-                columns.add(entry.getValue());
+            List<String> doc = new ArrayList<>();
+            for (String column : columns) {
+                doc.add(String.valueOf(map.get(column)));
             }
-
-            results.add(String.join(" | ", columns));
+            results.add(String.join(" | ", doc));
         }
 
         return results;
