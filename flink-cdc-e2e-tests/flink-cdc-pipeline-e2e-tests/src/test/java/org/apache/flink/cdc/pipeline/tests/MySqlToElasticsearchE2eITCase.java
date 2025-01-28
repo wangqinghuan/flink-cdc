@@ -24,23 +24,17 @@ import org.apache.flink.cdc.connectors.mysql.testutils.MySqlVersion;
 import org.apache.flink.cdc.connectors.mysql.testutils.UniqueDatabase;
 import org.apache.flink.cdc.pipeline.tests.utils.PipelineTestEnvironment;
 
-import co.elastic.clients.elasticsearch.ElasticsearchClient;
-import co.elastic.clients.elasticsearch.core.SearchRequest;
-import co.elastic.clients.elasticsearch.core.SearchResponse;
-import co.elastic.clients.elasticsearch.core.search.Hit;
-import co.elastic.clients.json.jackson.JacksonJsonpMapper;
-import co.elastic.clients.transport.rest_client.RestClientTransport;
-import org.apache.http.HttpHost;
-import org.apache.http.auth.AuthScope;
-import org.apache.http.auth.UsernamePasswordCredentials;
-import org.apache.http.client.CredentialsProvider;
-import org.apache.http.impl.client.BasicCredentialsProvider;
-import org.apache.http.impl.nio.client.HttpAsyncClientBuilder;
-import org.elasticsearch.client.RestClient;
-import org.elasticsearch.client.RestClientBuilder;
+import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.JSONObject;
+import org.apache.http.HttpResponse;
+import org.apache.http.client.methods.HttpDelete;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClients;
+import org.apache.http.util.EntityUtils;
 import org.junit.After;
 import org.junit.Before;
-import org.junit.BeforeClass;
 import org.junit.ClassRule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -48,7 +42,6 @@ import org.junit.runners.Parameterized;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testcontainers.containers.output.Slf4jLogConsumer;
-import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.lifecycle.Startables;
 
 import java.io.IOException;
@@ -56,13 +49,12 @@ import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
-import java.sql.SQLSyntaxErrorException;
 import java.sql.Statement;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.List;
-import java.util.Map;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -78,11 +70,11 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
     // ------------------------------------------------------------------------------------------
     protected static final String MYSQL_TEST_USER = "mysqluser";
     protected static final String MYSQL_TEST_PASSWORD = "mysqlpw";
-    private static final String ELASTICSEARCH_VERSION = "8.12.1";
-    private static final String DEFAULT_USERNAME = "elastic";
-    private static final String DEFAULT_PASSWORD = "123456";
-    public static final Duration DEFAULT_RESULT_VERIFY_TIMEOUT = Duration.ofSeconds(30);
-    private ElasticsearchClient client = createElasticsearchClient();
+
+    @Parameterized.Parameter(1)
+    public String elasticsearchVersion;
+
+    public static final Duration DEFAULT_RESULT_VERIFY_TIMEOUT = Duration.ofSeconds(120);
 
     @ClassRule
     public static final MySqlContainer MYSQL =
@@ -97,40 +89,41 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
                             .withNetwork(NETWORK)
                             .withNetworkAliases("mysql");
 
-    private static final org.testcontainers.elasticsearch.ElasticsearchContainer ELASTICSEARCH =
-            new ElasticsearchContainer(ELASTICSEARCH_VERSION)
-                    .withNetwork(NETWORK)
-                    .withNetworkAliases("elasticsearch")
-                    .withEnv("discovery.type", "single-node")
-                    .withEnv("xpack.security.enabled", "false")
-                    .withEnv("ES_JAVA_OPTS", "-Xms2g -Xmx2g")
-                    .withExposedPorts(9200, 9300)
-                    .withLogConsumer(new Slf4jLogConsumer(LOG))
-                    .waitingFor(
-                            Wait.forHttp("/_cluster/health")
-                                    .forStatusCodeMatching(
-                                            response -> response == 200 || response == 401)
-                                    .withStartupTimeout(Duration.ofMinutes(2)));
-
+    private org.testcontainers.elasticsearch.ElasticsearchContainer elasticsearchContainer;
+    private static final Integer MAX_ELASTICSERACH_FETCH_SIZE = 20;
     protected final UniqueDatabase mysqlInventoryDatabase =
             new UniqueDatabase(MYSQL, "mysql_inventory", MYSQL_TEST_USER, MYSQL_TEST_PASSWORD);
 
-    @BeforeClass
-    public static void initializeContainers() {
-        LOG.info("Starting containers...");
-        Startables.deepStart(Stream.of(MYSQL)).join();
-        Startables.deepStart(Stream.of(ELASTICSEARCH)).join();
-        LOG.info("Containers are started.");
+    @Parameterized.Parameters(name = "flinkVersion: {0}, elasticsearchVersion: {1}")
+    public static Collection<Object[]> getTestParameters() {
+        List<Object[]> parameters = new ArrayList<>();
+
+        for (String flinkVersion : Arrays.asList("1.19.1", "1.20.0")) {
+            parameters.add(new Object[] {flinkVersion, "6.8.20"});
+            parameters.add(new Object[] {flinkVersion, "7.10.2"});
+            parameters.add(new Object[] {flinkVersion, "8.12.1"});
+        }
+
+        return parameters;
+    }
+
+    protected String getElasticsearchDockerImageTag() {
+        return String.format(
+                "docker.elastic.co/elasticsearch/elasticsearch:%s", elasticsearchVersion);
     }
 
     @Before
     public void before() throws Exception {
         super.before();
         mysqlInventoryDatabase.createAndInitialize();
-        client = createElasticsearchClient();
-        createElasticsearchDatabase(mysqlInventoryDatabase.getDatabaseName(), "products");
+        elasticsearchContainer =
+                new ElasticsearchContainer(elasticsearchVersion)
+                        .withNetwork(NETWORK)
+                        .withNetworkAliases("elasticsearch")
+                        .withLogConsumer(new Slf4jLogConsumer(LOG));
 
-        createElasticsearchDatabase(mysqlInventoryDatabase.getDatabaseName(), "customers");
+        Startables.deepStart(Stream.of(MYSQL)).join();
+        Startables.deepStart(Stream.of(elasticsearchContainer)).join();
     }
 
     @After
@@ -138,12 +131,12 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
         super.after();
         mysqlInventoryDatabase.dropDatabase();
         try {
-            dropElasticsearchDatabase(mysqlInventoryDatabase.getDatabaseName(), "products");
-            dropElasticsearchDatabase(mysqlInventoryDatabase.getDatabaseName(), "customers");
-            if (client != null) {
-                client.shutdown();
+            dropElasticsearchIndex(mysqlInventoryDatabase.getDatabaseName() + "." + "products");
+            dropElasticsearchIndex(mysqlInventoryDatabase.getDatabaseName() + "." + "customers");
+            if (elasticsearchContainer != null) {
+                elasticsearchContainer.stop();
             }
-        } catch (IOException e) {
+        } catch (Exception e) {
             throw new RuntimeException(e);
         }
     }
@@ -175,7 +168,7 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
                         MYSQL_TEST_USER,
                         MYSQL_TEST_PASSWORD,
                         databaseName,
-                        ELASTICSEARCH_VERSION.split("\\.")[0] // Use major version number
+                        elasticsearchVersion.split("\\.")[0] // Use major version number
                         );
         Path mysqlCdcJar = TestUtils.getResource("mysql-cdc-pipeline-connector.jar");
         Path elasticsearchCdcConnector =
@@ -186,8 +179,7 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
         LOG.info("Pipeline job is running");
 
         validateSinkResult(
-                databaseName,
-                "products",
+                databaseName + "." + "products",
                 Arrays.asList("id", "name", "description", "weight", "enum_c", "json_c", "point_c"),
                 Arrays.asList(
                         "101 | scooter | Small 2-wheel scooter | 3.14 | red | {\"key1\": \"value1\"} | {\"coordinates\":[1,1],\"type\":\"Point\",\"srid\":0}",
@@ -201,8 +193,7 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
                         "109 | spare tire | 24 inch spare tire | 22.2 | null | null | null"));
 
         validateSinkResult(
-                mysqlInventoryDatabase.getDatabaseName(),
-                "customers",
+                databaseName + "." + "customers",
                 Arrays.asList("id", "name", "address", "phone_number"),
                 Arrays.asList(
                         "101 | user_1 | Shanghai | 123567891234",
@@ -225,8 +216,7 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
                     "INSERT INTO products VALUES (default,'jacket','water resistent white wind breaker',0.2, null, null, null);"); // 110
 
             validateSinkResult(
-                    databaseName,
-                    "products",
+                    databaseName + "." + "products",
                     Arrays.asList(
                             "id", "name", "description", "weight", "enum_c", "json_c", "point_c"),
                     Arrays.asList(
@@ -244,8 +234,7 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
             stat.execute("UPDATE products SET description='18oz carpenter hammer' WHERE id=106;");
             stat.execute("UPDATE products SET weight='5.1' WHERE id=107;");
             validateSinkResult(
-                    databaseName,
-                    "products",
+                    databaseName + "." + "products",
                     Arrays.asList(
                             "id", "name", "description", "weight", "enum_c", "json_c", "point_c"),
                     Arrays.asList(
@@ -266,8 +255,7 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
             stat.execute(
                     "INSERT INTO products VALUES (default,'finally', null, 2.14, null, null, null);"); // 112
             validateSinkResult(
-                    databaseName,
-                    "products",
+                    databaseName + "." + "products",
                     Arrays.asList(
                             "id", "name", "description", "weight", "enum_c", "json_c", "point_c"),
                     Arrays.asList(
@@ -288,31 +276,13 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
         }
     }
 
-    public void createElasticsearchDatabase(String databaseName, String tableName)
-            throws IOException {
-        client.indices().create(c -> c.index(databaseName + "." + tableName));
-    }
-
-    public void dropElasticsearchDatabase(String databaseName, String tableName)
-            throws IOException {
-        client.indices().delete(d -> d.index(databaseName + "." + tableName));
-    }
-
-    private void validateSinkResult(
-            String databaseName, String tableName, List<String> columns, List<String> expected)
+    private void validateSinkResult(String indexName, List<String> columns, List<String> expected)
             throws Exception {
-        waitAndVerify(
-                databaseName,
-                tableName,
-                columns,
-                expected,
-                DEFAULT_RESULT_VERIFY_TIMEOUT.toMillis(),
-                true);
+        waitAndVerify(indexName, columns, expected, DEFAULT_RESULT_VERIFY_TIMEOUT.toMillis(), true);
     }
 
     private void waitAndVerify(
-            String databaseName,
-            String tableName,
+            String indexName,
             List<String> columns,
             List<String> expected,
             long timeoutMilliseconds,
@@ -321,7 +291,7 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
         long deadline = System.currentTimeMillis() + timeoutMilliseconds;
         while (System.currentTimeMillis() < deadline) {
             try {
-                List<String> actual = fetchTableContent(databaseName, tableName, columns);
+                List<String> actual = fetchTableContent(indexName, columns);
                 if (inAnyOrder) {
                     if (expected.stream()
                             .sorted()
@@ -336,67 +306,79 @@ public class MySqlToElasticsearchE2eITCase extends PipelineTestEnvironment {
                 }
                 LOG.info(
                         "Executing {}:: didn't get expected results.\nExpected: {}\n  Actual: {}",
-                        databaseName,
+                        indexName,
                         expected,
                         actual);
-            } catch (SQLSyntaxErrorException t) {
-                LOG.info("Database {} isn't ready yet. Waiting for the next loop...", databaseName);
+            } catch (Exception t) {
+                LOG.info("Database {} isn't ready yet. Waiting for the next loop...", indexName);
             }
             Thread.sleep(1000L);
         }
-        fail(String.format("Failed to verify content of %s.", databaseName));
+        fail(String.format("Failed to verify content of %s.", indexName));
     }
 
-    private List<String> fetchTableContent(
-            String databaseName, String tableName, List<String> columns) throws Exception {
+    private List<String> fetchTableContent(String indexName, List<String> columns)
+            throws Exception {
 
         List<String> results = new ArrayList<>();
+        CloseableHttpClient httpClient = HttpClients.createDefault();
+        String url =
+                String.format(
+                        "http://%s:%d/%s/_search?from=0&size=%s",
+                        elasticsearchContainer.getHost(),
+                        elasticsearchContainer.getFirstMappedPort(),
+                        indexName,
+                        MAX_ELASTICSERACH_FETCH_SIZE);
 
-        SearchRequest searchRequest =
-                SearchRequest.of(
-                        s ->
-                                s.index(databaseName + "." + tableName)
-                                        .query(q -> q.matchAll(m -> m))
-                                        .size(100));
-        SearchResponse<Map> searchResponse = client.search(searchRequest, Map.class);
+        HttpGet request = new HttpGet(url);
+        HttpResponse response = httpClient.execute(request);
 
-        List<Hit<Map>> hits = searchResponse.hits().hits();
+        int statusCode = response.getStatusLine().getStatusCode();
+        String responseBody = EntityUtils.toString(response.getEntity());
 
-        for (Hit<Map> hit : hits) {
-            Map map = hit.source();
+        if (statusCode != 200) {
+            LOG.error("Failed to query index. Status code: {}", statusCode);
+            Thread.sleep(1000);
+            throw new Exception();
+        }
+        JSONObject jsonObject = JSON.parseObject(responseBody);
+        JSONObject hits = jsonObject.getJSONObject("hits");
+        JSONArray jsonArray = hits.getJSONArray("hits");
+        for (int i = 0; i < jsonArray.size(); i++) {
+            JSONObject json = jsonArray.getJSONObject(i);
+            JSONObject sourceObject = json.getJSONObject("_source");
             List<String> doc = new ArrayList<>();
             for (String column : columns) {
-                doc.add(String.valueOf(map.get(column)));
+                doc.add(String.valueOf(sourceObject.get(column)));
             }
             results.add(String.join(" | ", doc));
         }
-
         return results;
     }
 
-    private ElasticsearchClient createElasticsearchClient() {
-        final CredentialsProvider credentialsProvider = new BasicCredentialsProvider();
-        credentialsProvider.setCredentials(
-                AuthScope.ANY, new UsernamePasswordCredentials(DEFAULT_USERNAME, DEFAULT_PASSWORD));
-        RestClientTransport transport =
-                new RestClientTransport(
-                        RestClient.builder(
-                                        new HttpHost(
-                                                ELASTICSEARCH.getHost(),
-                                                ELASTICSEARCH.getFirstMappedPort(),
-                                                "http"))
-                                .setHttpClientConfigCallback(
-                                        new RestClientBuilder.HttpClientConfigCallback() {
-                                            @Override
-                                            public HttpAsyncClientBuilder customizeHttpClient(
-                                                    HttpAsyncClientBuilder httpAsyncClientBuilder) {
-                                                return httpAsyncClientBuilder
-                                                        .setDefaultCredentialsProvider(
-                                                                credentialsProvider);
-                                            }
-                                        })
-                                .build(),
-                        new JacksonJsonpMapper());
-        return new ElasticsearchClient(transport);
+    private void dropElasticsearchIndex(String indexName) {
+        String url =
+                String.format(
+                        "http://%s:%d/%s",
+                        elasticsearchContainer.getHost(),
+                        elasticsearchContainer.getFirstMappedPort(),
+                        indexName);
+        LOG.info("Dropping Elasticsearch index: {}", url);
+        try (CloseableHttpClient httpClient = HttpClients.createDefault()) {
+            HttpDelete request = new HttpDelete(url);
+            HttpResponse response = httpClient.execute(request);
+
+            int statusCode = response.getStatusLine().getStatusCode();
+            String responseBody = EntityUtils.toString(response.getEntity());
+            LOG.info("Delete index response (status code {}): \n{}", statusCode, responseBody);
+
+            if (statusCode != 200 && statusCode != 404) {
+                LOG.error("Failed to delete index. Status code: {}", statusCode);
+                throw new RuntimeException("Failed to delete index. Status code: " + statusCode);
+            }
+        } catch (IOException e) {
+            LOG.error("Error while deleting Elasticsearch index", e);
+            throw new RuntimeException("Failed to delete index", e);
+        }
     }
 }
